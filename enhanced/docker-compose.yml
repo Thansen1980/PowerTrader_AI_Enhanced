@@ -1,0 +1,182 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: pt_postgres
+    environment:
+      POSTGRES_DB: powertrader
+      POSTGRES_USER: powertrader
+      POSTGRES_PASSWORD: ${PT_DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U powertrader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - powertrader
+
+  # Redis for caching and message queue
+  redis:
+    image: redis:7-alpine
+    container_name: pt_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - powertrader
+
+  # API server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pt_api
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    environment:
+      PT_DATABASE__URL: postgresql://powertrader:${PT_DB_PASSWORD:-changeme}@postgres/powertrader
+      PT_REDIS__HOST: redis
+      PT_TRADING_MODE: ${PT_TRADING_MODE:-paper}
+      PT_ROBINHOOD_API_KEY: ${PT_ROBINHOOD_API_KEY}
+      PT_ROBINHOOD_PRIVATE_KEY: ${PT_ROBINHOOD_PRIVATE_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - powertrader
+
+  # Signal generator
+  signals:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pt_signals
+    command: python signals.py
+    environment:
+      PT_DATABASE__URL: postgresql://powertrader:${PT_DB_PASSWORD:-changeme}@postgres/powertrader
+      PT_REDIS__HOST: redis
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - powertrader
+
+  # Trader (order execution)
+  trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pt_trader
+    command: python trader.py
+    environment:
+      PT_DATABASE__URL: postgresql://powertrader:${PT_DB_PASSWORD:-changeme}@postgres/powertrader
+      PT_REDIS__HOST: redis
+      PT_TRADING_MODE: ${PT_TRADING_MODE:-paper}
+      PT_ROBINHOOD_API_KEY: ${PT_ROBINHOOD_API_KEY}
+      PT_ROBINHOOD_PRIVATE_KEY: ${PT_ROBINHOOD_PRIVATE_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - api
+      - signals
+    restart: unless-stopped
+    networks:
+      - powertrader
+
+  # Dashboard (web UI)
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: pt_dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_WS_URL: ws://localhost:8000
+    depends_on:
+      - api
+    networks:
+      - powertrader
+
+  # Grafana for monitoring
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pt_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3001:3000"
+    depends_on:
+      - postgres
+    networks:
+      - powertrader
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pt_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - powertrader
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  grafana_data:
+    driver: local
+  prometheus_data:
+    driver: local
+
+networks:
+  powertrader:
+    driver: bridge
