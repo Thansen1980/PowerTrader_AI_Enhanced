@@ -320,37 +320,83 @@ def _refresh_paths_and_symbols():
 
 
 
-#API STUFF
-API_KEY = ""
-BASE64_PRIVATE_KEY = ""
+# -----------------------------------------------------------------------
+# Multi-exchange credential loader
+# Reads gui_settings.json → "exchange" field, then loads the right files.
+#   Robinhood  -> r_key.txt    + r_secret.txt
+#   Kraken     -> kr_key.txt   + kr_secret.txt
+#   Binance    -> bn_key.txt   + bn_secret.txt
+# -----------------------------------------------------------------------
+_EXCHANGE_CRED_FILES = {
+    "robinhood": ("r_key.txt",  "r_secret.txt"),
+    "kraken":    ("kr_key.txt", "kr_secret.txt"),
+    "binance":   ("bn_key.txt", "bn_secret.txt"),
+}
 
-try:
-    with open('r_key.txt', 'r', encoding='utf-8') as f:
-        API_KEY = (f.read() or "").strip()
-    with open('r_secret.txt', 'r', encoding='utf-8') as f:
-        BASE64_PRIVATE_KEY = (f.read() or "").strip()
-except Exception:
-    API_KEY = ""
-    BASE64_PRIVATE_KEY = ""
+def _load_selected_exchange() -> str:
+    try:
+        cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_settings.json")
+        if os.path.isfile(cfg):
+            with open(cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            exch = str(data.get("exchange", "robinhood")).strip().lower()
+            if exch in _EXCHANGE_CRED_FILES:
+                return exch
+    except Exception:
+        pass
+    # Also honour the env var set by pt_hub.py
+    env = os.environ.get("POWERTRADER_EXCHANGE", "").strip().lower()
+    if env in _EXCHANGE_CRED_FILES:
+        return env
+    return "robinhood"
 
-if not API_KEY or not BASE64_PRIVATE_KEY:
-    print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
-    )
-    raise SystemExit(1)
+_SELECTED_EXCHANGE = _load_selected_exchange()
+
+def _load_exchange_creds(exchange: str) -> tuple:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    key_file, secret_file = _EXCHANGE_CRED_FILES[exchange]
+    kp = os.path.join(base_dir, key_file)
+    sp = os.path.join(base_dir, secret_file)
+    if not os.path.isfile(kp) or not os.path.isfile(sp):
+        print(
+            f"\n[PowerTrader] {exchange.title()} API credentials not found.\n"
+            f"Open the GUI → Settings → Exchange is set to '{exchange}' → Setup Wizard → Save.\n"
+            f"Expected files: {key_file}  and  {secret_file}\n"
+        )
+        raise SystemExit(1)
+    with open(kp, "r", encoding="utf-8") as f:
+        api_key = (f.read() or "").strip()
+    with open(sp, "r", encoding="utf-8") as f:
+        api_secret = (f.read() or "").strip()
+    if not api_key or not api_secret:
+        print(f"\n[PowerTrader] {key_file} or {secret_file} is empty. Re-run the Setup Wizard.\n")
+        raise SystemExit(1)
+    return api_key, api_secret
+
+API_KEY, BASE64_PRIVATE_KEY = _load_exchange_creds(_SELECTED_EXCHANGE)
+print(f"[PowerTrader] Exchange: {_SELECTED_EXCHANGE.title()} (OK)")
 
 class CryptoAPITrading:
     def __init__(self):
         # keep a copy of the folder map (same idea as trader.py)
         self.path_map = dict(base_paths)
 
+        self.exchange = _SELECTED_EXCHANGE
         self.api_key = API_KEY
-        private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
+        self.api_secret = BASE64_PRIVATE_KEY
+
+        if self.exchange == "robinhood":
+            private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
+            self.private_key = SigningKey(private_key_seed)
+            self.base_url = "https://trading.robinhood.com"
+        elif self.exchange == "kraken":
+            self.base_url = "https://api.kraken.com"
+            self.private_key = None
+        elif self.exchange == "binance":
+            self.base_url = "https://api.binance.com"
+            self.private_key = None
+        else:
+            raise ValueError(f"Unknown exchange: {self.exchange}")
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = list(DCA_LEVELS)  # Hard DCA triggers (percent PnL)
@@ -542,7 +588,12 @@ class CryptoAPITrading:
             return 0.0, None
 
     def _wait_for_order_terminal(self, symbol: str, order_id: str) -> Optional[dict]:
-        """Blocks until order is filled/canceled/rejected, then returns the order dict."""
+        """Blocks until order is filled/canceled/rejected, then returns the order dict.
+        For Binance/Kraken, market orders fill instantly so we return a synthetic filled dict."""
+        if self.exchange != "robinhood":
+            # Market orders on Binance/Kraken are synchronous — already filled by the time
+            # place_buy_order / place_sell_order returns. Return a minimal filled dict.
+            return {"state": "filled", "id": order_id}
         terminal = {"filled", "canceled", "cancelled", "rejected", "failed", "error"}
         while True:
             o = self._get_order_by_id(symbol, order_id)
@@ -555,10 +606,9 @@ class CryptoAPITrading:
             time.sleep(1)
 
     def _reconcile_pending_orders(self) -> None:
-        """
-        If the hub/trader restarts mid-order, we keep the pre-order buying_power on disk and
-        finish the accounting once the order shows as terminal in Robinhood.
-        """
+        """Reconcile pending orders after restart. Robinhood-only."""
+        if self.exchange != "robinhood":
+            return   # Binance/Kraken orders are synchronous — nothing to reconcile
         try:
             pending = self._pnl_ledger.get("pending_orders", {})
             if not isinstance(pending, dict) or not pending:
@@ -1094,25 +1144,28 @@ class CryptoAPITrading:
         self._dca_buy_ts[base] = []
 
 
+    # ----------------------------------------------------------------
+    # Robinhood low-level request helpers (unchanged)
+    # ----------------------------------------------------------------
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
-
+        if self.exchange != "robinhood":
+            raise RuntimeError(
+                f"make_api_request called on exchange '{self.exchange}' — "
+                "this is a Robinhood-only method. Use the exchange-specific helpers instead."
+            )
         timestamp = self._get_current_timestamp()
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
-
         try:
             if method == "GET":
                 response = requests.get(url, headers=headers, timeout=10)
             elif method == "POST":
                 response = requests.post(url, headers=headers, json=json.loads(body), timeout=10)
-
             response.raise_for_status()
             return response.json()
-        except requests.HTTPError as http_err:
+        except requests.HTTPError:
             try:
-                # Parse and return the JSON error response
-                error_response = response.json()
-                return error_response  # Return the JSON error for further handling
+                return response.json()
             except Exception:
                 return None
         except Exception:
@@ -1123,35 +1176,132 @@ class CryptoAPITrading:
     ) -> Dict[str, str]:
         message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
         signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-
         return {
             "x-api-key": self.api_key,
             "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
             "x-timestamp": str(timestamp),
         }
 
+    # ----------------------------------------------------------------
+    # Kraken signed POST helper
+    # ----------------------------------------------------------------
+    def _kraken_private(self, endpoint: str, data: dict) -> Any:
+        import urllib.parse, hashlib, hmac as _hmac
+        nonce = str(int(time.time() * 1000))
+        data["nonce"] = nonce
+        post = urllib.parse.urlencode(data)
+        msg = endpoint.encode() + hashlib.sha256((nonce + post).encode()).digest()
+        sig = base64.b64encode(
+            _hmac.new(base64.b64decode(self.api_secret), msg, hashlib.sha512).digest()
+        ).decode()
+        resp = requests.post(
+            "https://api.kraken.com" + endpoint,
+            headers={"API-Key": self.api_key, "API-Sign": sig},
+            data=data, timeout=10
+        )
+        return resp.json()
+
+    # ----------------------------------------------------------------
+    # Binance signed GET/POST helper
+    # ----------------------------------------------------------------
+    def _binance_signed(self, method: str, endpoint: str, params: dict) -> Any:
+        import urllib.parse, hmac as _hmac, hashlib
+        params["timestamp"] = int(time.time() * 1000)
+        query = urllib.parse.urlencode(params)
+        sig = _hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"https://api.binance.com{endpoint}?{query}&signature={sig}"
+        hdrs = {"X-MBX-APIKEY": self.api_key}
+        if method == "GET":
+            return requests.get(url, headers=hdrs, timeout=10).json()
+        return requests.post(url, headers=hdrs, timeout=10).json()
+
     def get_account(self) -> Any:
+        if self.exchange == "kraken":
+            raw = self._kraken_private("/0/private/Balance", {})
+            balances = raw.get("result", {})
+            usd = float(balances.get("ZUSD", balances.get("USD", 0)))
+            return {"buying_power": usd, "total_buying_power": usd}
+        if self.exchange == "binance":
+            raw = self._binance_signed("GET", "/api/v3/account", {})
+            usd = 0.0
+            for b in raw.get("balances", []):
+                if b["asset"] in ("USDT", "BUSD", "USDC"):
+                    usd += float(b["free"])
+            return {"buying_power": usd, "total_buying_power": usd}
+        # robinhood
         path = "/api/v1/crypto/trading/accounts/"
         return self.make_api_request("GET", path)
 
     def get_holdings(self) -> Any:
+        if self.exchange == "kraken":
+            raw = self._kraken_private("/0/private/Balance", {})
+            balances = raw.get("result", {})
+            results = []
+            for asset, qty in balances.items():
+                if asset in ("ZUSD", "USD", "USDT"):
+                    continue
+                # Normalise Kraken asset codes: XXBT->BTC, XETH->ETH, etc.
+                code = asset.lstrip("XZ") if asset.startswith(("X", "Z")) and len(asset) == 4 else asset
+                results.append({"asset_code": code, "total_quantity": str(qty)})
+            return {"results": results}
+        if self.exchange == "binance":
+            raw = self._binance_signed("GET", "/api/v3/account", {})
+            results = []
+            for b in raw.get("balances", []):
+                qty = float(b["free"]) + float(b["locked"])
+                if qty > 0 and b["asset"] not in ("USDT", "BUSD", "USDC", "BNB"):
+                    results.append({"asset_code": b["asset"], "total_quantity": str(qty)})
+            return {"results": results}
+        # robinhood
         path = "/api/v1/crypto/trading/holdings/"
         return self.make_api_request("GET", path)
 
     def get_trading_pairs(self) -> Any:
+        if self.exchange != "robinhood":
+            return []   # Not used for Binance/Kraken
         path = "/api/v1/crypto/trading/trading_pairs/"
         response = self.make_api_request("GET", path)
-
         if not response or "results" not in response:
             return []
-
-        trading_pairs = response.get("results", [])
-        if not trading_pairs:
-            return []
-
-        return trading_pairs
+        return response.get("results", [])
 
     def get_orders(self, symbol: str) -> Any:
+        if self.exchange == "binance":
+            coin = symbol.replace("-USD","").replace("-USDT","").replace("-USDC","").upper()
+            pair = f"{coin}USDC"
+            raw = self._binance_signed("GET", "/api/v3/myTrades", {"symbol": pair, "limit": 500})
+            # Normalise to Robinhood-style {results:[{side,state,executions:[{quantity,effective_price}]}]}
+            results = []
+            for t in (raw if isinstance(raw, list) else []):
+                results.append({
+                    "side": "buy" if t.get("isBuyer") else "sell",
+                    "state": "filled",
+                    "created_at": str(t.get("time", "")),
+                    "executions": [{
+                        "quantity": str(t.get("qty", 0)),
+                        "effective_price": str(t.get("price", 0)),
+                    }]
+                })
+            return {"results": results}
+        if self.exchange == "kraken":
+            coin = symbol.replace("-USD","").replace("-USDT","").replace("-USDC","").upper()
+            pair = f"{coin}USD"
+            raw = self._kraken_private("/0/private/TradesHistory", {})
+            results = []
+            for tid, t in (raw.get("result", {}).get("trades", {}) or {}).items():
+                if t.get("pair", "").upper().replace("XBT","BTC") != pair.upper():
+                    continue
+                results.append({
+                    "side": t.get("type", "buy"),
+                    "state": "filled",
+                    "created_at": str(t.get("time", "")),
+                    "executions": [{
+                        "quantity": str(t.get("vol", 0)),
+                        "effective_price": str(t.get("price", 0)),
+                    }]
+                })
+            return {"results": results}
+        # robinhood
         path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
         return self.make_api_request("GET", path)
 
@@ -1209,6 +1359,34 @@ class CryptoAPITrading:
 
         return cost_basis
 
+    def _fetch_one_price(self, symbol: str):
+        """Return (ask, bid) for a symbol using the configured exchange."""
+        coin = symbol.replace("-USD", "").replace("-USDT", "").replace("-USDC", "").upper()
+
+        if self.exchange == "binance":
+            url = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={coin}USDC"
+            r = requests.get(url, headers={"X-MBX-APIKEY": self.api_key}, timeout=10)
+            d = r.json()
+            ask = float(d["askPrice"]); bid = float(d["bidPrice"])
+            return ask, bid
+
+        if self.exchange == "kraken":
+            pair = f"{coin}USD"
+            r = requests.get(f"https://api.kraken.com/0/public/Ticker?pair={pair}", timeout=10)
+            d = r.json()
+            if d.get("error"): raise RuntimeError(d["error"])
+            t = next(iter(d["result"].values()))
+            ask = float(t["a"][0]); bid = float(t["b"][0])
+            return ask, bid
+
+        # robinhood
+        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
+        response = self.make_api_request("GET", path)
+        if response and "results" in response:
+            result = response["results"][0]
+            return float(result["ask_inclusive_of_buy_spread"]), float(result["bid_inclusive_of_sell_spread"])
+        raise RuntimeError(f"No price data for {symbol}")
+
     def get_price(self, symbols: list) -> Dict[str, float]:
         buy_prices = {}
         sell_prices = {}
@@ -1217,32 +1395,22 @@ class CryptoAPITrading:
         for symbol in symbols:
             if symbol == "USDC-USD":
                 continue
-
-            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-            response = self.make_api_request("GET", path)
-
-            if response and "results" in response:
-                result = response["results"][0]
-                ask = float(result["ask_inclusive_of_buy_spread"])
-                bid = float(result["bid_inclusive_of_sell_spread"])
-
+            try:
+                ask, bid = self._fetch_one_price(symbol)
                 buy_prices[symbol] = ask
                 sell_prices[symbol] = bid
                 valid_symbols.append(symbol)
-
-                # Update cache for transient failures later
                 try:
                     self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
                 except Exception:
                     pass
-            else:
-                # Fallback to cached bid/ask so account value never drops due to a transient miss
+            except Exception:
+                # Fallback to cache
                 cached = None
                 try:
                     cached = self._last_good_bid_ask.get(symbol)
                 except Exception:
-                    cached = None
-
+                    pass
                 if cached:
                     ask = float(cached.get("ask", 0.0) or 0.0)
                     bid = float(cached.get("bid", 0.0) or 0.0)
@@ -1253,6 +1421,34 @@ class CryptoAPITrading:
 
         return buy_prices, sell_prices, valid_symbols
 
+
+    def _place_order_binance(self, symbol: str, side: str, notional_usd: float) -> Any:
+        """Place a market order on Binance by notional USD amount."""
+        coin = symbol.replace("-USD", "").replace("-USDT", "").replace("-USDC", "").upper()
+        pair = f"{coin}USDC"
+        # Binance market buy by quoteOrderQty (USDC amount)
+        params = {"symbol": pair, "side": side.upper(), "type": "MARKET",
+                  "quoteOrderQty": f"{notional_usd:.2f}"}
+        return self._binance_signed("POST", "/api/v3/order", params)
+
+    def _place_order_binance_qty(self, symbol: str, side: str, quantity: float) -> Any:
+        """Place a market order on Binance by asset quantity (for sells)."""
+        coin = symbol.replace("-USD", "").replace("-USDT", "").replace("-USDC", "").upper()
+        pair = f"{coin}USDC"
+        params = {"symbol": pair, "side": side.upper(), "type": "MARKET",
+                  "quantity": f"{quantity:.8f}"}
+        return self._binance_signed("POST", "/api/v3/order", params)
+
+    def _place_order_kraken(self, symbol: str, side: str, volume: float) -> Any:
+        """Place a market order on Kraken."""
+        coin = symbol.replace("-USD", "").replace("-USDT", "").upper()
+        pair = f"{coin}USD"
+        return self._kraken_private("/0/private/AddOrder", {
+            "ordertype": "market",
+            "type": side.lower(),
+            "volume": f"{volume:.8f}",
+            "pair": pair,
+        })
 
     def place_buy_order(
         self,
@@ -1265,6 +1461,44 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        # ── Binance ──────────────────────────────────────────────────
+        if self.exchange == "binance":
+            try:
+                current_buy_prices, _, _ = self.get_price([symbol])
+                current_price = current_buy_prices.get(symbol, 0)
+                qty = amount_in_usd / current_price if current_price else 0
+                resp = self._place_order_binance(symbol, "BUY", amount_in_usd)
+                if resp and "orderId" in resp:
+                    self._record_trade(side="buy", symbol=symbol,
+                        qty=float(resp.get("executedQty", qty)),
+                        price=float(resp.get("fills", [{}])[0].get("price", current_price)) if resp.get("fills") else current_price,
+                        avg_cost_basis=avg_cost_basis, pnl_pct=pnl_pct, tag=tag,
+                        order_id=str(resp["orderId"]),
+                        buying_power_before=None, buying_power_after=None, buying_power_delta=None)
+                return resp
+            except Exception as e:
+                print(f"[Binance BUY error] {e}")
+                return None
+
+        # ── Kraken ───────────────────────────────────────────────────
+        if self.exchange == "kraken":
+            try:
+                current_buy_prices, _, _ = self.get_price([symbol])
+                current_price = current_buy_prices.get(symbol, 1)
+                qty = amount_in_usd / current_price
+                resp = self._place_order_kraken(symbol, "buy", qty)
+                if resp and not resp.get("error"):
+                    txids = resp.get("result", {}).get("txid", [])
+                    self._record_trade(side="buy", symbol=symbol, qty=qty,
+                        price=current_price, avg_cost_basis=avg_cost_basis,
+                        pnl_pct=pnl_pct, tag=tag,
+                        order_id=txids[0] if txids else None,
+                        buying_power_before=None, buying_power_after=None, buying_power_delta=None)
+                return resp
+            except Exception as e:
+                print(f"[Kraken BUY error] {e}")
+                return None
+
         # Fetch the current price of the asset (for sizing only)
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
         current_price = current_buy_prices[symbol]
@@ -1391,6 +1625,40 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        # ── Binance ──────────────────────────────────────────────────
+        if self.exchange == "binance":
+            try:
+                resp = self._place_order_binance_qty(symbol, "SELL", asset_quantity)
+                if resp and "orderId" in resp:
+                    fills = resp.get("fills", [])
+                    fill_price = float(fills[0]["price"]) if fills else (expected_price or 0)
+                    self._record_trade(side="sell", symbol=symbol,
+                        qty=float(resp.get("executedQty", asset_quantity)),
+                        price=fill_price, avg_cost_basis=avg_cost_basis,
+                        pnl_pct=pnl_pct, tag=tag,
+                        order_id=str(resp["orderId"]),
+                        buying_power_before=None, buying_power_after=None, buying_power_delta=None)
+                return resp
+            except Exception as e:
+                print(f"[Binance SELL error] {e}")
+                return None
+
+        # ── Kraken ───────────────────────────────────────────────────
+        if self.exchange == "kraken":
+            try:
+                resp = self._place_order_kraken(symbol, "sell", asset_quantity)
+                if resp and not resp.get("error"):
+                    txids = resp.get("result", {}).get("txid", [])
+                    self._record_trade(side="sell", symbol=symbol, qty=asset_quantity,
+                        price=expected_price, avg_cost_basis=avg_cost_basis,
+                        pnl_pct=pnl_pct, tag=tag,
+                        order_id=txids[0] if txids else None,
+                        buying_power_before=None, buying_power_after=None, buying_power_delta=None)
+                return resp
+            except Exception as e:
+                print(f"[Kraken SELL error] {e}")
+                return None
+
         body = {
             "client_order_id": client_order_id,
             "side": side,

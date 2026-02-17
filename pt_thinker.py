@@ -88,32 +88,119 @@ class RobinhoodMarketData:
         return float(result["ask_inclusive_of_buy_spread"])
 
 
+# -----------------------------------------------------------------------
+# Multi-exchange credential loader
+# Reads gui_settings.json to find which exchange is selected, then loads
+# the matching credential files.
+#   Robinhood  -> r_key.txt    + r_secret.txt
+#   Kraken     -> kr_key.txt   + kr_secret.txt
+#   Binance    -> bn_key.txt   + bn_secret.txt
+# -----------------------------------------------------------------------
+_EXCHANGE_CRED_FILES = {
+    "robinhood": ("r_key.txt",  "r_secret.txt"),
+    "kraken":    ("kr_key.txt", "kr_secret.txt"),
+    "binance":   ("bn_key.txt", "bn_secret.txt"),
+}
+
+def _load_selected_exchange() -> str:
+    """Return the exchange name saved in gui_settings.json (default: robinhood)."""
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_settings.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            exch = str(data.get("exchange", "robinhood")).strip().lower()
+            if exch in _EXCHANGE_CRED_FILES:
+                return exch
+    except Exception:
+        pass
+    return "robinhood"
+
+def _load_exchange_creds() -> tuple:
+    """Return (api_key, api_secret, exchange_name) from the correct credential files."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    exchange = _load_selected_exchange()
+    key_file, secret_file = _EXCHANGE_CRED_FILES[exchange]
+    key_path    = os.path.join(base_dir, key_file)
+    secret_path = os.path.join(base_dir, secret_file)
+
+    if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+        raise RuntimeError(
+            f"[RUNNER] Missing {key_file} and/or {secret_file} next to pt_thinker.py.\n"
+            f"Open the GUI → Settings → Exchange is set to '{exchange}' → "
+            f"click 'Setup Wizard' and save your credentials."
+        )
+
+    with open(key_path, "r", encoding="utf-8") as f:
+        api_key = (f.read() or "").strip()
+    with open(secret_path, "r", encoding="utf-8") as f:
+        api_secret = (f.read() or "").strip()
+
+    return api_key, api_secret, exchange
+
+
+# -----------------------------------------------------------------------
+# Exchange-aware current-ask fetchers
+# -----------------------------------------------------------------------
+_PRICE_CLIENT = None   # cached client (reset if exchange changes)
+_PRICE_CLIENT_EXCHANGE = None
+
+def _get_binance_ask(symbol: str, api_key: str) -> float:
+    """Fetch best ask from Binance REST (no auth needed for market data)."""
+    coin = symbol.replace("-USD", "").replace("-USDT", "").replace("-USDC", "").upper()
+    url = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={coin}USDC"
+    resp = requests.get(url, timeout=10, headers={"X-MBX-APIKEY": api_key})
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Binance HTTP {resp.status_code}: {resp.text}")
+    data = resp.json()
+    return float(data["askPrice"])
+
+def _get_kraken_ask(symbol: str) -> float:
+    """Fetch best ask from Kraken REST (public endpoint, no auth needed)."""
+    coin = symbol.replace("-USD", "").replace("-USDT", "").upper()
+    pair = f"{coin}USD"
+    url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Kraken HTTP {resp.status_code}: {resp.text}")
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"Kraken error: {data['error']}")
+    result = data.get("result", {})
+    ticker = next(iter(result.values()))   # first (only) key
+    return float(ticker["a"][0])           # ask price
+
+def get_current_ask(symbol: str) -> float:
+    """
+    Returns the current ask price for `symbol` (e.g. 'BTC-USD') using
+    whichever exchange is selected in gui_settings.json.
+    Automatically switches exchange + credentials if the setting changes.
+    """
+    global _RH_MD, _PRICE_CLIENT, _PRICE_CLIENT_EXCHANGE
+
+    api_key, api_secret, exchange = _load_exchange_creds()
+
+    # Reset cached client if exchange changed
+    if exchange != _PRICE_CLIENT_EXCHANGE:
+        _RH_MD = None
+        _PRICE_CLIENT = None
+        _PRICE_CLIENT_EXCHANGE = exchange
+
+    if exchange == "binance":
+        return _get_binance_ask(symbol, api_key)
+
+    elif exchange == "kraken":
+        return _get_kraken_ask(symbol)
+
+    else:  # robinhood (default)
+        if _RH_MD is None:
+            _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=api_secret)
+        return _RH_MD.get_current_ask(symbol)
+
+
+# Keep old name as alias so any other code that calls it still works
 def robinhood_current_ask(symbol: str) -> float:
-    """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
-    """
-    global _RH_MD
-    if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
-
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
-
-
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
-
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
-
-    return _RH_MD.get_current_ask(symbol)
+    return get_current_ask(symbol)
 
 
 def restart_program():
